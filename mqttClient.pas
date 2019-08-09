@@ -10,10 +10,10 @@ unit mqttClient;
 
 interface
 
-uses SysUtils, Classes, BlckSock, NBlockSock, contnrs, SyncObjs;
+uses SysUtils, Classes, BlckSock, NBlockSock, ssl_openssl, contnrs, SyncObjs;
 
-const MAXRecMessagesCount = 1000;                                               // максимальное количество непрочтенных сообщений
-      MAXPubMessagesCount = 4000;                                               // максимальное количество сообщений на отправку
+const MAXRecMessagesCount = 1000;                                               // РјР°РєСЃРёРјР°Р»СЊРЅРѕРµ РєРѕР»РёС‡РµСЃС‚РІРѕ РЅРµРїСЂРѕС‡С‚РµРЅРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№
+      MAXPubMessagesCount = 4000;                                               // РјР°РєСЃРёРјР°Р»СЊРЅРѕРµ РєРѕР»РёС‡РµСЃС‚РІРѕ СЃРѕРѕР±С‰РµРЅРёР№ РЅР° РѕС‚РїСЂР°РІРєСѓ
 
 type TMQTTMessageType = (
       mtReserved0 = 0,                                                          // Reserved
@@ -93,17 +93,22 @@ type TMQTTMessageType = (
        FCritSection: TCriticalSection;
        FSubscribeList: TObjectList;
        FSubscribeListChanged: Boolean;
-       FRecMessages: TObjectQueue;                                              // буфер принятых сообщений
+       FRecMessages: TObjectQueue;                                              // Р±СѓС„РµСЂ РїСЂРёРЅСЏС‚С‹С… СЃРѕРѕР±С‰РµРЅРёР№
        //
        FSendMessagesChanged: Boolean;
-       FSendMessages: TObjectList;                                              // буфер уже отправленных сообщений, которые ожидают ACK
-       FPubMessages: TObjectQueue;                                              // буфер сообщений ожидающих отправку
+       FSendMessages: TObjectList;                                              // Р±СѓС„РµСЂ СѓР¶Рµ РѕС‚РїСЂР°РІР»РµРЅРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№, РєРѕС‚РѕСЂС‹Рµ РѕР¶РёРґР°СЋС‚ ACK
+       FPubMessages: TObjectQueue;                                              // Р±СѓС„РµСЂ СЃРѕРѕР±С‰РµРЅРёР№ РѕР¶РёРґР°СЋС‰РёС… РѕС‚РїСЂР°РІРєСѓ
        FBuffering: Boolean;
        //
        FLastErrorMessage: String;
        FPublishedCount: LongWord;
        FReceivedCount: LongWord;
        FDroppedCount: LongWord;
+       //
+       FUseSSL: Boolean;
+       FSSLCertCAFile: String;
+       FPrivateKeyFile: String;
+       FCertificateFile: String;
        //
        procedure DoConnect;
        procedure DoLogin;
@@ -147,6 +152,11 @@ type TMQTTMessageType = (
        property ClientId: String read FClientId write FClientId;
        property Buffering: Boolean read FBuffering write FBuffering;
        property AddTimeStamp: Boolean read FAddTimeStamp write FAddTimeStamp;
+       //
+       property SSLUse: Boolean read FUseSSL write FUseSSL;
+       property SSLCertCAFile: String read FSSLCertCAFile write FSSLCertCAFile;
+       property SSLPrivateKeyFile: String read FPrivateKeyFile write FPrivateKeyFile;
+       property SSLCertificateFile: String read FCertificateFile write FCertificateFile;
       protected
        procedure Execute; override;
      end;
@@ -294,6 +304,11 @@ begin
  FSendMessagesChanged:= False;
  FBuffering:= False;
  //
+ FUseSSL:= False;
+ FSSLCertCAFile:= '';
+ FPrivateKeyFile:= '';
+ FCertificateFile:= '';
+ //
  FPublishedCount:= 0;
  FReceivedCount:= 0;
  FDroppedCount:= 0;
@@ -320,7 +335,7 @@ begin
  FreeAndNil(FTCP);
 end;
 
-// возвращает строку с добавленными в начале двумя байтами длинны
+// РІРѕР·РІСЂР°С‰Р°РµС‚ СЃС‚СЂРѕРєСѓ СЃ РґРѕР±Р°РІР»РµРЅРЅС‹РјРё РІ РЅР°С‡Р°Р»Рµ РґРІСѓРјСЏ Р±Р°Р№С‚Р°РјРё РґР»РёРЅРЅС‹
 
 procedure TMQTTClient.GetNextPacketId;
 begin
@@ -348,9 +363,9 @@ begin
  result:= False;
  If not FTCP.CanReadEx(WaitTimeOut) then Exit;
  If FTCP.WaitingDataEx <= 0 then raise MQTTException.Create('connection reset by peer');
- // чтение FH
+ // С‡С‚РµРЅРёРµ FH
  Data.FH:= FTCP.RecvByte(FTimeOut);
- // чтение RemainingLength
+ // С‡С‚РµРЅРёРµ RemainingLength
  RL:= 0;
  Mul:= 1;
  repeat
@@ -358,7 +373,7 @@ begin
   RL:= RL + (Digit and $7F)*Mul;
   Mul:= Mul * 128;
  until (Digit and $80) = 0;
- // чтение остатка
+ // С‡С‚РµРЅРёРµ РѕСЃС‚Р°С‚РєР°
  Data.VH:= FTCP.RecvBufferStr(RL, FTimeOut);
  Data.Payload:= '';
  //
@@ -381,11 +396,11 @@ var CtrlPacket: TControlPacket;
     TickNow: LongWord;
 begin
  TickNow:= GetTick();
- // проверка истечения KeepAlive на прием пакетов
+ // РїСЂРѕРІРµСЂРєР° РёСЃС‚РµС‡РµРЅРёСЏ KeepAlive РЅР° РїСЂРёРµРј РїР°РєРµС‚РѕРІ
  If TickDelta(FLastControlRecv, TickNow) > FKeepAlive*1000 then raise MQTTException.Create('keepalive timeout expired');
- // проверка необходимости передать PINGREQ
+ // РїСЂРѕРІРµСЂРєР° РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё РїРµСЂРµРґР°С‚СЊ PINGREQ
  If (not FWaitPINGRESP) and (TickDelta(FLastControlSend, TickNow) > (FKeepAlive*3000 div 4)) then begin
-  // передаю PINGREQ когда истекло 3/4 KeepAlive
+  // РїРµСЂРµРґР°СЋ PINGREQ РєРѕРіРґР° РёСЃС‚РµРєР»Рѕ 3/4 KeepAlive
   CtrlPacket.FH:= FixedHeader(mtPINGREQ, False, 0, False);
   CtrlPacket.VH:= '';
   CtrlPacket.Payload:= '';
@@ -423,6 +438,17 @@ begin
  FTCP.NonBlockConnect(FHost, IntToStr(FPort), FTimeOut);
  AddLog(LOG_INFO, Format('MQTTClient: connected to %s.%u', [FHost, FPort]));
  If not FTCP.SetKeepAlive(True) then AddLog(LOG_WARNING, 'MQTTClient: can''t set SO_KEEPALIVE option');
+ //
+ If FUseSSL then begin
+  FTCP.SSL.CertCAFile:= FSSLCertCAFile;
+  // РµСЃР»Рё СѓРєР°Р·Р°РЅ СЃРµСЂС‚РёС„РёРєР°С‚ С†РµРЅС‚СЂР° СЃРµСЂС‚РёС„РёРєР°С†РёРё, С‚Рѕ РІРєР»СЋС‡Р°РµРј РїСЂРѕРІРµСЂРєСѓ СЃРµСЂС‚РёС„РёРєР°С‚Р° СЃРµСЂРІРµСЂР°
+  If Length(FSSLCertCAFile) > 0 then FTCP.SSL.VerifyCert:= True;
+  FTCP.SSL.PrivateKeyFile:= FPrivateKeyFile;
+  FTCP.SSL.CertificateFile:= FCertificateFile;
+  //
+  FTCP.SSLDoConnect;
+  AddLog(LOG_INFO, Format('MQTTClient: SSL/TLS connection established, version: %s', [FTCP.SSL.GetSSLVersion()]));
+ end;
  FWaitPINGRESP:= False;
  FConnected:= True;
 end;
@@ -434,7 +460,7 @@ begin
  {$IFDEF DEBUG_MQTT}
  AddLog(LOG_DEBUG, 'TMQTTClient.DoLogin');
  {$ENDIF}
- // посылаю пакет CONNECT
+ // РїРѕСЃС‹Р»Р°СЋ РїР°РєРµС‚ CONNECT
  With CtrlPacket do begin
   FH:= FixedHeader(mtCONNECT, False, 0, False);
   //
@@ -453,7 +479,7 @@ begin
    CF:= CF + 4;                                    // will flag
    CF:= CF + FWillQoS shl 3;                       // will QoS
    //CF:= CF + 32;                                 // will retain ???
-   // добавляем в Payload топик и сообщение
+   // РґРѕР±Р°РІР»СЏРµРј РІ Payload С‚РѕРїРёРє Рё СЃРѕРѕР±С‰РµРЅРёРµ
    Payload:= Payload + StrToMQTT(FWillTopic) + StrToMQTT(FWillMessage);
   end;
   If Length(FUserName) > 0 then begin
@@ -470,7 +496,7 @@ begin
  end;
  //
  SendControlPacket(CtrlPacket);
- // ожидаю в ответ CONNACK
+ // РѕР¶РёРґР°СЋ РІ РѕС‚РІРµС‚ CONNACK
  If not ReceiveControlPacket(CtrlPacket, 10000) then raise MQTTException.Create('broker not answer');
  If FixedHeaderType(CtrlPacket.FH) <> mtCONNACK then raise MQTTException.CreateFmt('unexpected packet FH:%.2x instead CONNACK', [CtrlPacket.FH]);
  If Length(CtrlPacket.VH) < 2 then raise MQTTException.Create('CONNACK not have return code field');
@@ -483,10 +509,10 @@ begin
   #5: raise MQTTException.Create('connection refused, not authorized');
   else raise MQTTException.CreateFmt('connection refused, return code:0x%.2x', [Byte(CtrlPacket.VH[2])]);
  end;
- // подключение выполнено успешно
+ // РїРѕРґРєР»СЋС‡РµРЅРёРµ РІС‹РїРѕР»РЅРµРЅРѕ СѓСЃРїРµС€РЅРѕ
  SetLastErrorMessage('');
  FLoggedIn:= True;
- // инициализация всего после подключения
+ // РёРЅРёС†РёР°Р»РёР·Р°С†РёСЏ РІСЃРµРіРѕ РїРѕСЃР»Рµ РїРѕРґРєР»СЋС‡РµРЅРёСЏ
  AfterLogin;
 end;
 
@@ -494,11 +520,11 @@ procedure TMQTTClient.AfterLogin;
 var I: Integer;
 begin
  FPacketId:= 1;
- // сброс признаков отправки для сообщений ожидающих подтверждения
+ // СЃР±СЂРѕСЃ РїСЂРёР·РЅР°РєРѕРІ РѕС‚РїСЂР°РІРєРё РґР»СЏ СЃРѕРѕР±С‰РµРЅРёР№ РѕР¶РёРґР°СЋС‰РёС… РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ
  For I:= 1 to FSendMessages.Count do (FSendMessages.Items[I-1] as TMQTTMessage).FSendFlag:= False;
- // устанавливаем флаг необходимости повторной посылки неподтвержденных сообщений
+ // СѓСЃС‚Р°РЅР°РІР»РёРІР°РµРј С„Р»Р°Рі РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё РїРѕРІС‚РѕСЂРЅРѕР№ РїРѕСЃС‹Р»РєРё РЅРµРїРѕРґС‚РІРµСЂР¶РґРµРЅРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№
  FSendMessagesChanged:= FSendMessages.Count > 0;
- // инициализация списка подписок
+ // РёРЅРёС†РёР°Р»РёР·Р°С†РёСЏ СЃРїРёСЃРєР° РїРѕРґРїРёСЃРѕРє
  FCritSection.Enter;
  try
   For I:= 1 to FSubscribeList.Count do (FSubscribeList.Items[I-1] as TSubscribeItem).Reset;
@@ -532,7 +558,7 @@ begin
   finally
    FCritSection.Leave;
   end;
-  // передаем пакет подписки, если есть что отправлять
+  // РїРµСЂРµРґР°РµРј РїР°РєРµС‚ РїРѕРґРїРёСЃРєРё, РµСЃР»Рё РµСЃС‚СЊ С‡С‚Рѕ РѕС‚РїСЂР°РІР»СЏС‚СЊ
   If Length(Payload) > 0 then begin
    FH:= FixedHeader(mtSUBSCRIBE, False, 1, False);
    // PacketId
@@ -573,7 +599,7 @@ begin
   Case FixedHeaderType(RecData.FH) of
    mtPINGRESP: FWaitPINGRESP:= False;                                           // PINGRESP
    mtSUBACK: begin                                                              // SUBACK
-    // подтверждение подписки
+    // РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РїРѕРґРїРёСЃРєРё
     PacketId:= Byte(RecData.VH[1]) * 256 + Byte(RecData.VH[2]);
     FCritSection.Enter;
     try
@@ -589,7 +615,7 @@ begin
     end;
    end;
    mtPUBLISH: begin                                                             // PUBLISH
-    // пришли данные по подписке
+    // РїСЂРёС€Р»Рё РґР°РЅРЅС‹Рµ РїРѕ РїРѕРґРїРёСЃРєРµ
     Index:= Byte(RecData.VH[1]) * 256 + Byte(RecData.VH[2]);
     TopicName:= Copy(RecData.VH, 3, Index);
     Index:= Index + 3;
@@ -602,7 +628,7 @@ begin
     {$IFDEF DEBUG_MQTT}
     AddLog(LOG_DEBUG, Format(' packetId:%u topic:"%s" message:"%s"', [PacketId, TopicName, AppMessage]));
     {$ENDIF}
-    // кладем пакет в выходную очередь
+    // РєР»Р°РґРµРј РїР°РєРµС‚ РІ РІС‹С…РѕРґРЅСѓСЋ РѕС‡РµСЂРµРґСЊ
     FCritSection.Enter;
     try
      If FRecMessages.Count < MAXRecMessagesCount then FRecMessages.Push(TMQTTMessage.Create(TopicName, AppMessage, RecData.RQoS, RecData.RRetain, PacketId));
@@ -610,7 +636,7 @@ begin
     finally
      FCritSection.Leave;
     end;
-    // при QoS = 1 передаем подтверждение PUBACK
+    // РїСЂРё QoS = 1 РїРµСЂРµРґР°РµРј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ PUBACK
     If RecData.RQoS = 1 then begin
      RecData.FH:= FixedHeader(mtPUBACK, False, 0, False);
      RecData.VH:= Char(PacketId div 256) + Char(PacketId mod 256);
@@ -619,7 +645,7 @@ begin
     end;
    end;
    mtPUBACK: begin                                                              // PUBACK
-    // пришло подтверждение PUBLISH
+    // РїСЂРёС€Р»Рѕ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ PUBLISH
     PacketId:= Byte(RecData.VH[1]) * 256 + Byte(RecData.VH[2]);
     For I:= 1 to FSendMessages.Count do begin
      If (FSendMessages.Items[I-1] as TMQTTMessage).FPacketId = PacketId then begin
@@ -642,7 +668,7 @@ var MM: TMQTTMessage;
     I: Integer;
 begin
  If FSendMessagesChanged then begin
-  // повторная посылка неподтвержденных сообщений
+  // РїРѕРІС‚РѕСЂРЅР°СЏ РїРѕСЃС‹Р»РєР° РЅРµРїРѕРґС‚РІРµСЂР¶РґРµРЅРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№
   For I:= 1 to FSendMessages.Count do begin
    MM:= FSendMessages.Items[I-1] as TMQTTMessage;
    If not MM.FSendFlag then begin
@@ -651,21 +677,21 @@ begin
   end;
   FSendMessagesChanged:= False;
  end;
- // посылка сообщений из очереди на отправку
+ // РїРѕСЃС‹Р»РєР° СЃРѕРѕР±С‰РµРЅРёР№ РёР· РѕС‡РµСЂРµРґРё РЅР° РѕС‚РїСЂР°РІРєСѓ
  repeat
-  // если количество сообщений в очереди отправленных и не подтвержденных больше 50, то
-  // новых туда не добавляем и ждем подтверждений
+  // РµСЃР»Рё РєРѕР»РёС‡РµСЃС‚РІРѕ СЃРѕРѕР±С‰РµРЅРёР№ РІ РѕС‡РµСЂРµРґРё РѕС‚РїСЂР°РІР»РµРЅРЅС‹С… Рё РЅРµ РїРѕРґС‚РІРµСЂР¶РґРµРЅРЅС‹С… Р±РѕР»СЊС€Рµ 50, С‚Рѕ
+  // РЅРѕРІС‹С… С‚СѓРґР° РЅРµ РґРѕР±Р°РІР»СЏРµРј Рё Р¶РґРµРј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёР№
   If FSendMessages.Count > 50 then Break;
-  // очередное сообщение из очереди
+  // РѕС‡РµСЂРµРґРЅРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ РёР· РѕС‡РµСЂРµРґРё
   MM:= GetPubMessage();
   If MM = Nil then Break;
-  // передаю брокеру
+  // РїРµСЂРµРґР°СЋ Р±СЂРѕРєРµСЂСѓ
   PublishMessage(MM);
   If MM.FQoS = 1 then begin
-   // если QoS = 1 перемещаю в буфер уже отправленных сообщений для ожидания подтверждения
+   // РµСЃР»Рё QoS = 1 РїРµСЂРµРјРµС‰Р°СЋ РІ Р±СѓС„РµСЂ СѓР¶Рµ РѕС‚РїСЂР°РІР»РµРЅРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№ РґР»СЏ РѕР¶РёРґР°РЅРёСЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ
    FSendMessages.Add(MM);
   end else begin
-   // иначе освобождаю память
+   // РёРЅР°С‡Рµ РѕСЃРІРѕР±РѕР¶РґР°СЋ РїР°РјСЏС‚СЊ
    FreeAndNil(MM);
   end;
  until False;
@@ -674,7 +700,7 @@ end;
 procedure TMQTTClient.PublishMessage(MQTTMsg: TMQTTMessage);
 var CtrlPacket: TControlPacket;
 begin
- // отправка сообщения брокеру
+ // РѕС‚РїСЂР°РІРєР° СЃРѕРѕР±С‰РµРЅРёСЏ Р±СЂРѕРєРµСЂСѓ
  With CtrlPacket do begin
   FH:= FixedHeader(mtPUBLISH, False, MQTTMsg.FQoS, MQTTMsg.FRetain);
   VH:= StrToMQTT(MQTTMsg.FTopic);
@@ -700,13 +726,13 @@ begin
    DoConnect;
    DoLogin;
    While not Terminated do begin
-    // подписка
+    // РїРѕРґРїРёСЃРєР°
     If FSubscribeListChanged then DoSubscribe;
-    // прием пакетов от брокера
+    // РїСЂРёРµРј РїР°РєРµС‚РѕРІ РѕС‚ Р±СЂРѕРєРµСЂР°
     DoReceive;
-    // публикация
+    // РїСѓР±Р»РёРєР°С†РёСЏ
     DoSend;
-    // проверка истечения KeepAlive
+    // РїСЂРѕРІРµСЂРєР° РёСЃС‚РµС‡РµРЅРёСЏ KeepAlive
     If FKeepAlive > 0 then CheckKeepAlive;
    end;
   except
@@ -737,11 +763,11 @@ var I: Integer;
 begin
  FCritSection.Enter;
  try
-  // поиск дубликатов
+  // РїРѕРёСЃРє РґСѓР±Р»РёРєР°С‚РѕРІ
   For I:= 1 to FSubscribeList.Count do begin
    If TSubscribeItem(FSubscribeList.Items[I-1]).FTopic = ATopic then Exit;
   end;
-  // добавляем в список
+  // РґРѕР±Р°РІР»СЏРµРј РІ СЃРїРёСЃРѕРє
   FSubscribeList.Add(TSubscribeItem.Create(ATopic));
   FSubscribeListChanged:= True;
  finally
@@ -783,13 +809,13 @@ end;
 procedure TMQTTClient.Publish(const ATopic, AMessage: String; const AQoS: Byte; const ARetain: Boolean);
 var UTF8Message: String;
 begin
- // если клиент подключен или включена буферизация отправки добавляем сообщение в очередь
+ // РµСЃР»Рё РєР»РёРµРЅС‚ РїРѕРґРєР»СЋС‡РµРЅ РёР»Рё РІРєР»СЋС‡РµРЅР° Р±СѓС„РµСЂРёР·Р°С†РёСЏ РѕС‚РїСЂР°РІРєРё РґРѕР±Р°РІР»СЏРµРј СЃРѕРѕР±С‰РµРЅРёРµ РІ РѕС‡РµСЂРµРґСЊ
  If FLoggedIn or FBuffering then begin
   UTF8Message:= CharsetConversion(AMessage, CP1251, UTF_8);
   FCritSection.Enter;
   try
    If FPubMessages.Count > MAXPubMessagesCount then begin
-    // удаление самой старой записи
+    // СѓРґР°Р»РµРЅРёРµ СЃР°РјРѕР№ СЃС‚Р°СЂРѕР№ Р·Р°РїРёСЃРё
     FPubMessages.Pop.Free;
     Inc(FDroppedCount);
    end;
