@@ -3,4 +3,11 @@
 ![GitHub](https://img.shields.io/github/license/crossrw/mqttClient.svg)
 
 # mqttClient
+
 MQTT client for Delphi &amp; FPC
+
+
+
+## Limitations
+
+Not support QOS = 2.
