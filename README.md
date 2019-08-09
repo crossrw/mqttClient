@@ -10,4 +10,4 @@ MQTT client for Delphi &amp; FPC
 
 ## Limitations
 
-Not support QOS = 2.
+Not supported QOS (Quality Of Service) = 2.
